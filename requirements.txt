@@ -3,3 +3,6 @@ langchain-openai
 python-dotenv
 youtube-transcript-api
 langchain-text-splitters
+langchain-chroma
+chromadb
+streamlit

@@ -4,3 +4,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 chroma_db/
+chat_sessions.json
+chat_sessions.json.tmp

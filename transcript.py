@@ -1,4 +1,3 @@
-from langchain_openai import ChatOpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv

@@ -1,39 +1,65 @@
 import argparse
+import sys
+from pathlib import Path
 
-from chunking import create_chunks
+from chunking import chunk_documents
+from loaders import load_file, load_youtube
 from rag import answer_question
-from transcript import get_transcript, get_video_id
-from vector_store import store_transcript
+from vector_store import index_source
 
 
-def index_video(url: str) -> str:
-	video_id = get_video_id(url)
-	chunks = create_chunks(get_transcript(video_id))
-	count = store_transcript(video_id, chunks)
-	print(f"Indexed {count} chunks for video {video_id}.")
-	return video_id
+if hasattr(sys.stdout, "reconfigure"):
+	sys.stdout.reconfigure(encoding="utf-8")
+
+
+def index_target(target: str) -> None:
+	"""Index a YouTube URL or a local file path."""
+	if target.startswith(("http://", "https://")):
+		loaded = load_youtube(target)
+	else:
+		path = Path(target)
+		if not path.is_file():
+			raise FileNotFoundError(target)
+		loaded = load_file(path.name, path.read_bytes())
+
+	chunks = chunk_documents(loaded.documents, loaded.source_id)
+	count = index_source(loaded, chunks)
+	print(f"Indexed {loaded.source_name}: {count} chunks.")
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="Chat with YouTube transcripts.")
-	parser.add_argument("url", help="YouTube video URL to index")
+	parser = argparse.ArgumentParser(description="Chat across indexed sources.")
+	parser.add_argument(
+		"sources",
+		nargs="+",
+		help="YouTube URLs and/or file paths (PDF, Excel, CSV, Word, text, images).",
+	)
 	parser.add_argument("--question", help="Ask one question and exit")
 	args = parser.parse_args()
-	video_id = index_video(args.url)
+
+	for target in args.sources:
+		index_target(target)
+
+	history: list[dict] = []
 
 	if args.question:
-		answer, _ = answer_question(args.question, video_id=video_id)
+		answer, _ = answer_question(args.question, history=history)
 		print(f"\n{answer}")
 		return
 
-	print("Transcript indexed. Ask questions, or type 'exit' to quit.")
+	print("Sources indexed. Ask questions, or type 'exit' to quit.")
 	while True:
 		question = input("\nYou: ").strip()
 		if question.lower() in {"exit", "quit"}:
 			break
-		if question:
-			answer, _ = answer_question(question, video_id=video_id)
-			print(f"AI: {answer}")
+		if not question:
+			continue
+		answer, _ = answer_question(question, history=history)
+		history += [
+			{"role": "user", "content": question},
+			{"role": "assistant", "content": answer},
+		]
+		print(f"AI: {answer}")
 
 
 if __name__ == "__main__":

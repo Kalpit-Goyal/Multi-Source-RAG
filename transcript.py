@@ -1,23 +1,43 @@
-from youtube_transcript_api import YouTubeTranscriptApi
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
+
 from dotenv import load_dotenv
-import re
+from youtube_transcript_api import YouTubeTranscriptApi
+
 load_dotenv()
 
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
+
+
 def get_video_id(url):
-    parsed=urlparse(url)
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
 
-    if parsed.hostname=="youtu.be":
-        return parsed.path[1:]
+    if host not in YOUTUBE_HOSTS:
+        raise ValueError("Invalid YouTube URL")
 
-    if parsed.hostname in ("www.youtube.com","youtube.com"):
-        return parse_qs(parsed.query)["v"][0]
+    if host in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/").split("/")[0]
+    else:
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live", "v"}:
+            video_id = parts[1]
+        else:
+            values = parse_qs(parsed.query).get("v")
+            video_id = values[0] if values else ""
 
-    raise ValueError("Invalid Youtube URL")
+    if not video_id:
+        raise ValueError("Invalid YouTube URL: missing video id")
+    return video_id
+
 
 def get_transcript(video_id):
-    transcript=YouTubeTranscriptApi().fetch(video_id,languages=["en"],)
-    text=" ".join(chunk.text for chunk in transcript)
-    text = " ".join(text.split())
-    return text
-
+    transcript = YouTubeTranscriptApi().fetch(video_id, languages=["en"])
+    text = " ".join(chunk.text for chunk in transcript)
+    return " ".join(text.split())

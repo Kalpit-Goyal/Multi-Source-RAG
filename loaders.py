@@ -1,14 +1,20 @@
-"""Extract text from YouTube videos, documents, spreadsheets, and images."""
+"""Extract text from websites, YouTube videos, documents, sheets, and images."""
 
 from __future__ import annotations
 
 import csv
 import hashlib
 import io
+import ipaddress
+import os
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import requests
+from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 
 from transcript import get_transcript, get_video_id
@@ -22,6 +28,22 @@ SUPPORTED_SUFFIXES = (
 )
 ROWS_PER_BLOCK = 25
 BLOCK_CHARS = 1500
+
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
+MAX_WEBSITE_BYTES = int(os.getenv("MAX_WEBSITE_BYTES", "5000000"))
+MAX_WEBSITE_CHARS = int(os.getenv("MAX_WEBSITE_CHARS", "400000"))
+TRACKING_PARAMS = {"fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid"}
+USER_AGENT = os.getenv(
+    "WEBSITE_USER_AGENT",
+    "Mozilla/5.0 (compatible; MultiSourceRAG/1.0; +https://example.com/bot)",
+)
 
 
 @dataclass
@@ -57,6 +79,228 @@ def load_youtube(url: str) -> LoadedSource:
         source_name=f"YouTube: {video_id}",
         source_type="youtube",
         documents=[Document(page_content=text, metadata={"locator": "transcript"})],
+    )
+
+
+def is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in YOUTUBE_HOSTS
+
+
+def load_url(url: str) -> LoadedSource:
+    """Load a YouTube transcript or a public web page."""
+    return load_youtube(url) if is_youtube_url(url) else load_website(url)
+
+
+def _normalize_url(url: str) -> str:
+    """Canonicalize a URL so the same page is not indexed twice."""
+    candidate = (url or "").strip()
+    if not candidate:
+        raise ValueError("Empty URL")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme or 'missing'}")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError(f"Invalid URL: {url}")
+
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise ValueError(f"Refusing to fetch a private host: {host}")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+    ):
+        raise ValueError(f"Refusing to fetch a private address: {host}")
+
+    if host.startswith("www."):
+        host = host[4:]
+    port = parsed.port
+    if port and not (
+        (parsed.scheme == "http" and port == 80)
+        or (parsed.scheme == "https" and port == 443)
+    ):
+        host = f"{host}:{port}"
+
+    query = sorted(
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_")
+        and key.lower() not in TRACKING_PARAMS
+    )
+    path = parsed.path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/")
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            host,
+            path,
+            "",
+            urlencode(query),
+            "",
+        )
+    )
+
+
+def _fetch(url: str) -> tuple[bytes, str, str, str | None]:
+    """Download a page with a size cap. Returns bytes, content type, final URL, encoding."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.8",
+    }
+    with requests.get(
+        url,
+        headers=headers,
+        timeout=20,
+        allow_redirects=True,
+        stream=True,
+    ) as response:
+        response.raise_for_status()
+        content_type = (
+            response.headers.get("content-type", "").split(";")[0].strip().lower()
+        )
+        payload = bytearray()
+        for piece in response.iter_content(chunk_size=65536):
+            if not piece:
+                continue
+            payload.extend(piece)
+            if len(payload) > MAX_WEBSITE_BYTES:
+                raise ValueError(
+                    f"Website is larger than {MAX_WEBSITE_BYTES:,} bytes: {url}"
+                )
+        return (
+            bytes(payload),
+            content_type,
+            response.url,
+            response.encoding,
+        )
+
+
+def _html_documents(payload: bytes, url: str, encoding: str | None) -> list[Document]:
+    """Extract readable prose from an HTML page, dropping navigation and scripts."""
+    if not encoding:
+        try:
+            from charset_normalizer import from_bytes
+
+            best = from_bytes(payload).best()
+            encoding = best.encoding if best else "utf-8"
+        except Exception:
+            encoding = "utf-8"
+    html = payload.decode(encoding or "utf-8", errors="replace")
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "form",
+            "nav",
+            "footer",
+            "header",
+            "aside",
+            "iframe",
+            "button",
+        ]
+    ):
+        tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = " ".join(soup.title.string.split())
+    if not title:
+        heading = soup.find("h1")
+        title = " ".join(heading.get_text(" ", strip=True).split()) if heading else ""
+
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for element in root.find_all(
+        ["h1", "h2", "h3", "h4", "p", "li", "pre", "blockquote", "td", "th"]
+    ):
+        text = " ".join(element.get_text(" ", strip=True).split())
+        if len(text) < 25:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        # Nested markup (a <p> inside <li>) would otherwise repeat the text.
+        if blocks and key in blocks[-1].lower():
+            continue
+        seen.add(key)
+        blocks.append(text)
+
+    if not blocks:
+        fallback = " ".join(root.get_text(" ", strip=True).split())
+        if fallback:
+            blocks = [fallback]
+
+    text = "\n\n".join(blocks).strip()
+    if len(text) > MAX_WEBSITE_CHARS:
+        text = text[:MAX_WEBSITE_CHARS].rsplit(" ", 1)[0]
+    if not text:
+        return []
+
+    host = urlparse(url).netloc
+    return [
+        Document(
+            page_content=text,
+            metadata={
+                "locator": url,
+                "title": title or host,
+                "url": url,
+                "host": host,
+            },
+        )
+    ]
+
+
+def load_website(url: str) -> LoadedSource:
+    """Fetch a public web page (or a PDF served over HTTP) as a source."""
+    normalized = _normalize_url(url)
+    # Fetch the original URL (some sites only serve on ``www``) but key the
+    # source by its canonical form so duplicates collapse.
+    payload, content_type, final_url, encoding = _fetch(url.strip())
+    # Re-validate after redirects so a public URL cannot bounce to a private host.
+    _normalize_url(final_url)
+
+    if content_type == "application/pdf" or final_url.lower().endswith(".pdf"):
+        documents = _pdf_documents(payload)
+        source_type = "pdf"
+    else:
+        html_types = {
+            "text/html",
+            "application/xhtml+xml",
+            "text/plain",
+            "",
+        }
+        if content_type not in html_types:
+            raise ValueError(f"Unsupported website content type: {content_type}")
+        documents = _html_documents(payload, final_url, encoding)
+        source_type = "website"
+
+    if not documents:
+        raise ValueError(f"No readable text found at {url}")
+
+    title = (documents[0].metadata.get("title") or "").strip()
+    host = urlparse(final_url).netloc
+    source_name = title or host
+    if len(source_name) > 90:
+        source_name = source_name[:87].rstrip() + "..."
+
+    return LoadedSource(
+        source_id="web:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16],
+        source_name=source_name,
+        source_type=source_type,
+        documents=documents,
     )
 
 

@@ -2,6 +2,7 @@ langchain
 langchain-groq
 langchain-huggingface
 langgraph
+langgraph-checkpoint-sqlite
 sentence-transformers
 pypdf
 openpyxl
@@ -12,4 +13,18 @@ youtube-transcript-api
 langchain-text-splitters
 langchain-chroma
 chromadb
+rank-bm25
 streamlit
+requests
+beautifulsoup4
+
+# Observability and evaluation.
+langsmith
+# Pinned: ragas 0.4.x needs the compatibility shim in eval/_ragas_compat.py
+# on langchain-community 0.4.x (removed langchain_community.chat_models.vertexai).
+ragas==0.4.3
+datasets
+pandas
+
+# Tests.
+pytest

@@ -349,6 +349,8 @@ Fixed run for reproducible numbers. Setup: `eval/dataset.public.jsonl`
 `k=4`, answer and judge model `openai/gpt-oss-120b` on Groq free tier.
 RAGAS: 120 scores (`context_precision` + `context_recall` × 20 questions × 3 modes),
 all cached in `eval/results/free-tier-resume-20261025/ragas-20q-context-resume/`.
+The same numbers plus token usage, stage latency, and reproduction commands are
+collected in [`eval/RESULTS.md`](eval/RESULTS.md).
 
 **RAGAS (LLM judge)**
 
